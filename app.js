@@ -23,15 +23,16 @@ const FILE_PROMPT_KEY = "polyalign.humanEval.filePromptSeen";
 const state = {
   datasetKey: normalizeDatasetKey(localStorage.getItem(DATASET_KEY)),
   rows: [],
+  rowCache: {},
   refs: {},
   activeIndex: 0,
   annotations: normalizeAnnotations(readJson(STORAGE_KEY, {})),
   annotator: localStorage.getItem(ANNOTATOR_KEY) || "",
   blindMode: localStorage.getItem(BLIND_KEY) !== "false",
   sidebarOpen: true,
+  primaryScoringDataset: null,
   loadToken: 0,
-  jsonHandle: null,
-  csvHandle: null,
+  jsonHandles: { "5": null, "10": null },
   fileReady: false,
 };
 
@@ -99,7 +100,7 @@ function init() {
   els.content.addEventListener("keydown", handleContentKeydown);
   els.content.addEventListener("input", handleContentInput);
   els.content.addEventListener("change", handleContentChange);
-  els.setupFiles.addEventListener("click", setupFiles);
+  els.setupFiles.addEventListener("click", setupCurrentFile);
   els.skipFiles.addEventListener("click", () => closeFilePrompt(true));
   els.readerClose.addEventListener("click", closeReader);
   els.readerOverlay.addEventListener("click", (event) => {
@@ -138,6 +139,7 @@ async function loadDataset(datasetKey) {
     state.refs = refResponse.ok ? await refResponse.json() : {};
     if (token !== state.loadToken) return;
     state.rows = Array.isArray(rows) ? rows.map((row, index) => ({ ...row, __index: index })) : [];
+    state.rowCache[nextKey] = state.rows;
     render();
     setStatus("Ready");
   } catch (error) {
@@ -282,9 +284,9 @@ function renderScorePanel(row) {
       <div class="panel-actions">
         <button class="plain-button primary" type="button" data-action="confirm-score">${complete ? "Confirm score" : "Score all criteria"}</button>
         <button class="plain-button" type="button" data-action="clear-score">Clear</button>
-        <button class="plain-button" type="button" data-action="setup-files">Files</button>
-        <button class="plain-button" type="button" data-action="export-json">JSON</button>
-        <button class="plain-button" type="button" data-action="export-csv">CSV</button>
+        <button class="plain-button" type="button" data-action="setup-current-file">File for ${escapeHtml(DATASETS[state.datasetKey].shortLabel)}</button>
+        <button class="plain-button" type="button" data-action="download-5-json">Download 5bin</button>
+        <button class="plain-button" type="button" data-action="download-10-json">Download 10bin</button>
       </div>
       <p class="small-note">Marked means all five scores are selected and confirmed.</p>
     </section>
@@ -346,9 +348,9 @@ function handleContentClick(event) {
   if (action === "next-unmarked") nextUnmarked();
   if (action === "confirm-score") confirmScore();
   if (action === "clear-score") clearScore();
-  if (action === "setup-files") setupFiles();
-  if (action === "export-json") exportJson();
-  if (action === "export-csv") exportCsv();
+  if (action === "setup-current-file") setupCurrentFile();
+  if (action === "download-5-json") downloadJsonSnapshot("5");
+  if (action === "download-10-json") downloadJsonSnapshot("10");
 }
 
 function handleContentKeydown(event) {
@@ -392,9 +394,16 @@ async function confirmScore() {
     alert("Select all five scores first.");
     return;
   }
+  if (state.primaryScoringDataset && state.primaryScoringDataset !== state.datasetKey) {
+    const primary = DATASETS[state.primaryScoringDataset].label;
+    const current = DATASETS[state.datasetKey].label;
+    const ok = confirm(`You already confirmed scores in ${primary}. Scoring ${current} too will keep both sets separate. Continue?`);
+    if (!ok) return;
+  }
+  state.primaryScoringDataset = state.primaryScoringDataset || state.datasetKey;
   setAnnotation(key, { ...annotation, confirmedAt: new Date().toISOString() });
   render();
-  await writeLiveFiles();
+  await writeLiveFile(state.datasetKey);
   setStatus("Confirmed");
 }
 
@@ -421,28 +430,23 @@ function nextUnmarked() {
   }
 }
 
-async function setupFiles() {
+async function setupCurrentFile() {
   closeFilePrompt(true);
   if (!("showSaveFilePicker" in window)) {
-    exportJson();
-    exportCsv();
-    alert("Live file updates are not supported in this browser. Snapshot files were downloaded instead.");
+    await downloadJsonSnapshot(state.datasetKey);
+    alert("Live file updates are not supported in this browser. A JSON snapshot was downloaded instead.");
     return;
   }
 
   try {
-    const base = `polyalign_zh_human_eval_${DATASETS[state.datasetKey].shortLabel}`;
-    state.jsonHandle = await window.showSaveFilePicker({
-      suggestedName: `${base}.json`,
+    const datasetKey = state.datasetKey;
+    state.jsonHandles[datasetKey] = await window.showSaveFilePicker({
+      suggestedName: `${exportBaseName(datasetKey)}.json`,
       types: [{ description: "JSON", accept: { "application/json": [".json"] } }],
     });
-    state.csvHandle = await window.showSaveFilePicker({
-      suggestedName: `${base}.csv`,
-      types: [{ description: "CSV", accept: { "text/csv": [".csv"] } }],
-    });
     state.fileReady = true;
-    await writeLiveFiles();
-    setStatus("Files ready");
+    await writeLiveFile(datasetKey);
+    setStatus(`${DATASETS[datasetKey].shortLabel} file ready`);
   } catch {
     setStatus("Files skipped", false);
   }
@@ -465,11 +469,10 @@ function closeReader() {
   els.readerOverlay.hidden = true;
 }
 
-async function writeLiveFiles() {
-  if (!state.fileReady || !state.jsonHandle || !state.csvHandle) return;
-  const payload = buildExportPayload();
-  await writeHandle(state.jsonHandle, JSON.stringify(payload, null, 2));
-  await writeHandle(state.csvHandle, toCsv(exportRows(payload)));
+async function writeLiveFile(datasetKey) {
+  if (!state.fileReady || !state.jsonHandles[datasetKey]) return;
+  const payload = await buildExportPayloadForDataset(datasetKey);
+  await writeHandle(state.jsonHandles[datasetKey], JSON.stringify(payload, null, 2));
 }
 
 async function writeHandle(handle, content) {
@@ -478,32 +481,48 @@ async function writeHandle(handle, content) {
   await writable.close();
 }
 
-function exportJson() {
-  const payload = buildExportPayload();
-  downloadFile(`${exportBaseName()}.json`, JSON.stringify(payload, null, 2), "application/json");
+async function downloadJsonSnapshot(datasetKey) {
+  const payload = await buildExportPayloadForDataset(datasetKey);
+  downloadFile(`${exportBaseName(datasetKey)}.json`, JSON.stringify(payload, null, 2), "application/json");
 }
 
-function exportCsv() {
-  const payload = buildExportPayload();
-  downloadFile(`${exportBaseName()}.csv`, toCsv(exportRows(payload)), "text/csv");
+async function buildExportPayloadForDataset(datasetKey) {
+  await ensureRefs();
+  const rows = await getRowsForDataset(datasetKey);
+  return buildExportPayload(datasetKey, rows);
 }
 
-function buildExportPayload() {
-  const annotations = currentAnnotations();
+async function ensureRefs() {
+  if (Object.keys(state.refs).length) return;
+  const response = await fetch(REFERENCE_FILE);
+  state.refs = response.ok ? await response.json() : {};
+}
+
+async function getRowsForDataset(datasetKey) {
+  if (state.rowCache[datasetKey]) return state.rowCache[datasetKey];
+  const response = await fetch(DATASETS[datasetKey].file);
+  if (!response.ok) throw new Error(`Could not load ${DATASETS[datasetKey].label}`);
+  const rows = await response.json();
+  state.rowCache[datasetKey] = Array.isArray(rows) ? rows.map((row, index) => ({ ...row, __index: index })) : [];
+  return state.rowCache[datasetKey];
+}
+
+function buildExportPayload(datasetKey = state.datasetKey, rows = state.rows) {
+  const annotations = annotationsFor(datasetKey);
   return {
     schema_version: "polyalign_human_eval_v2",
     exported_at: new Date().toISOString(),
     annotator: state.annotator,
-    dataset: { key: state.datasetKey, label: DATASETS[state.datasetKey].label, file: DATASETS[state.datasetKey].file },
-    marked: getSummary(),
+    dataset: { key: datasetKey, label: DATASETS[datasetKey].label, file: DATASETS[datasetKey].file },
+    marked: getSummaryForRows(datasetKey, rows),
     criteria: CRITERIA,
-    annotations: state.rows.map((row, index) => {
-      const key = rowKey(row);
+    annotations: rows.map((row, index) => {
+      const key = rowKey(row, datasetKey);
       const annotation = annotations[key] || {};
       return {
         answer_key: key,
         answer_number: index + 1,
-        marked: isMarked(key),
+        marked: isMarked(key, datasetKey),
         confirmed_at: annotation.confirmedAt || null,
         sample_set: row.sample_set || "",
         row_sample_question_number: row.sample_question_number || null,
@@ -530,34 +549,6 @@ function buildExportPayload() {
       };
     }),
   };
-}
-
-function exportRows(payload) {
-  return payload.annotations.map((item) => ({
-    annotator: payload.annotator,
-    answer_key: item.answer_key,
-    answer_number: item.answer_number,
-    marked: item.marked,
-    confirmed_at: item.confirmed_at,
-    sample_set: item.sample_set,
-    row_sample_question_number: item.row_sample_question_number,
-    prompt_id: item.prompt_id,
-    dataset: item.dataset,
-    split: item.split,
-    track: item.track,
-    bucket_id: item.bucket_id,
-    family: item.family,
-    style_bucket: item.style_bucket,
-    length_bin: item.length_bin,
-    human_answer: item.human_answer,
-    main_model: item.main_model,
-    variant: item.variant,
-    prediction_model_name: item.prediction_model_name,
-    prediction_file: item.prediction_file,
-    ...item.scores,
-    safety_concern: item.safety_concern,
-    notes: item.notes,
-  }));
 }
 
 function peerRows(row) {
@@ -587,10 +578,10 @@ function activeRow() {
   return state.rows[state.activeIndex];
 }
 
-function rowKey(row) {
+function rowKey(row, datasetKey = state.datasetKey) {
   if (!row) return "";
   return [
-    state.datasetKey,
+    datasetKey,
     row.sample_question_number,
     row.id,
     row.main_model,
@@ -600,13 +591,17 @@ function rowKey(row) {
 }
 
 function getSummary() {
-  const total = state.rows.length;
-  const marked = state.rows.filter((row) => isMarked(rowKey(row))).length;
+  return getSummaryForRows(state.datasetKey, state.rows);
+}
+
+function getSummaryForRows(datasetKey, rows) {
+  const total = rows.length;
+  const marked = rows.filter((row) => isMarked(rowKey(row, datasetKey), datasetKey)).length;
   return { marked, total, unmarked: total - marked };
 }
 
-function isMarked(key) {
-  const annotation = currentAnnotations()[key];
+function isMarked(key, datasetKey = state.datasetKey) {
+  const annotation = annotationsFor(datasetKey)[key];
   return Boolean(annotation?.confirmedAt) && hasAllScores(annotation);
 }
 
@@ -627,8 +622,12 @@ function setAnnotation(key, annotation) {
 }
 
 function currentAnnotations() {
-  state.annotations[state.datasetKey] = state.annotations[state.datasetKey] || {};
-  return state.annotations[state.datasetKey];
+  return annotationsFor(state.datasetKey);
+}
+
+function annotationsFor(datasetKey) {
+  state.annotations[datasetKey] = state.annotations[datasetKey] || {};
+  return state.annotations[datasetKey];
 }
 
 function saveLocal() {
@@ -643,7 +642,7 @@ function saveLocal() {
 function setStatus(text, settle = true) {
   els.saveState.textContent = text;
   clearTimeout(setStatus.timer);
-  if (settle) setStatus.timer = setTimeout(() => { els.saveState.textContent = state.fileReady ? "Live files" : "Local save"; }, 700);
+  if (settle) setStatus.timer = setTimeout(() => { els.saveState.textContent = state.fileReady ? "Live JSON" : "Local save"; }, 700);
 }
 
 function updateDatasetButtons() {
@@ -684,20 +683,8 @@ function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
 
-function exportBaseName() {
-  return `polyalign_zh_human_eval_${DATASETS[state.datasetKey].shortLabel}`;
-}
-
-function toCsv(rows) {
-  if (!rows.length) return "";
-  const headers = Object.keys(rows[0]);
-  return [headers.join(","), ...rows.map((row) => headers.map((header) => csvCell(row[header])).join(","))].join("\r\n");
-}
-
-function csvCell(value) {
-  if (value === null || value === undefined) return "";
-  const text = String(value);
-  return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
+function exportBaseName(datasetKey = state.datasetKey) {
+  return `polyalign_zh_human_eval_${DATASETS[datasetKey].shortLabel}`;
 }
 
 function downloadFile(filename, content, type) {
